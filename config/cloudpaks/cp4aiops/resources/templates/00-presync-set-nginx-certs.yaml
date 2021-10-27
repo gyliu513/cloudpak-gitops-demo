@@ -1,0 +1,61 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "201"
+    argocd.argoproj.io/hook: PreSync
+  name: cp4aiops-set-nginx-certs
+  namespace: openshift-gitops
+spec:
+  template:
+    spec:
+      containers:
+        - name: config
+          image: quay.io/openshift/origin-cli:latest
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "250m"
+            limits:
+              memory: "128Mi"
+              cpu: "500m"
+          env:
+            - name: TARGET_NAMESPACE
+              value: "{{.Values.metadata.argocd_app_namespace}}"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              result=0
+              ingress_secret_name=$(oc get ingresscontroller.operator default \
+                      --namespace openshift-ingress-operator \
+                      -o jsonpath='{.spec.defaultCertificate.name}')
+              if [ -n "${ingress_secret_name}" ]; then
+                  oc patch -n "${TARGET_NAMESPACE}" automationuiconfig iaf-system --type merge --patch '{"spec": {"tls": {"certificateSecret": {"secretName": "external-tls-secret"}}}}' \
+                  && echo "INFO: Retrieving default ingress certificate." \
+                  && cert=$(oc get secret "${ingress_secret_name}" \
+                      --namespace openshift-ingress \
+                      -o jsonpath='{.data.tls\.crt}') \
+                  && cert_key=$(oc get secret "${ingress_secret_name}" \
+                      --namespace openshift-ingress \
+                      -o jsonpath='{.data.tls\.key}') \
+                  && oc get secret default-ssl -n "${TARGET_NAMESPACE}" -o yaml \
+                  && echo "INFO: Patching default-ssl certificate with ingress certificate." \
+                  && oc patch secret default-ssl \
+                      --namespace "${TARGET_NAMESPACE}"  \
+                      --type=merge -p \
+                      "{\"data\": { \"cert.crt\": \"${cert}\", \"cert.key\": \"${cert_key}\"}}" \
+                  && echo "INFO: Restarting foundational services nginx pods." \
+                  && oc rollout restart Deployment/ibm-nginx \
+                      --namespace "${TARGET_NAMESPACE}" \
+                  && oc rollout status Deployment/ibm-nginx \
+                      --namespace "${TARGET_NAMESPACE}" \
+                  || result=1
+              else
+                  log "INFO: No default ingress set for the cluster."
+              fi
+
+      restartPolicy: Never
+      serviceAccountName: {{.Values.serviceaccount.argocd_application_controller}}
+  backoffLimit: 1
